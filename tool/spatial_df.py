@@ -1,0 +1,94 @@
+from coembedding.function import co_embedding
+import numpy as np
+from numba import jit
+import scanpy as sc
+import pandas as pd
+import math
+import datatable as dt
+from scipy.spatial.distance import cdist
+from joblib import Parallel, delayed
+import logging
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
+
+logging.basicConfig(level=logging.INFO)
+
+@jit(nopython=True)
+def cal_distance(X):
+    adj_mt=np.zeros((X.shape[0],X.shape[0]))
+    for i in range(X.shape[0]):
+        for j in range(X.shape[0]):
+            #adj_df[i,j]=torch.sqrt(torch.sum(torch.square(X[i,:]-X[j,:])))
+            adj_mt[i,j]=np.linalg.norm(X[i,:]-X[j,:])
+    return adj_mt
+
+
+def spatial_graph(RNA_ret_adata, Spatial_data_adata, outdir, q=20, p=20):
+    adata_path=outdir+'/co_adata.h5ad'
+    if os.path.exists(adata_path):
+        print("Data exists, load it")
+        adata=sc.read_h5ad(adata_path)
+    else:
+        adata = co_embedding(data_list=[RNA_ret_adata,Spatial_data_adata],outdir=outdir)
+        adata.write(adata_path)
+
+    sc_data=adata[adata.obs['batch']=="0"]
+    st_data=adata[adata.obs['batch']=="1"]
+
+    #Calculates the distance between two pairs in co-embedding space
+    final_adj_df_path=outdir+'/final_adj_df.txt'
+    if os.path.exists(final_adj_df_path):
+        print("load adj dataframe")
+        final_spot_df=pd.read_csv(final_adj_df_path,index_col=0)
+    else:
+        X=adata.obsm['latent']
+        adj_mt=cal_distance(X)
+        print("Finish calculate distance")
+
+        adj_df=pd.DataFrame(adj_mt,index=adata.obs_names, columns=adata.obs_names)
+        adj_df = adj_df.rename_axis('index').reset_index()
+        adj_df.index=adata.obs_names
+
+        #
+        adj_df.loc[sc_data.obs_names,sc_data.obs_names]=np.nan
+        new_adj_df=pd.melt(adj_df,id_vars='index',var_name='index2', value_name='dis').dropna(axis=0,how='any')
+
+        #cell
+        cell_df=new_adj_df[new_adj_df["index2"].isin(list(sc_data.obs_names)) & new_adj_df["index"].isin(list(st_data.obs_names))]
+        cell_df1 = cell_df.sort_values(['index2','dis'], ascending=[True, True]).groupby('index2', group_keys=False).apply(lambda x: x.head(p))
+        # cell_df2 = cell_df1.copy()
+        # cell_df2[['index', 'index2']] = cell_df2[['index2', 'index']]
+        # final_cell_df=pd.concat([cell_df1,cell_df2],ignore_index=True)
+        # final_cell_df["dis"] /= math.ceil(final_cell_df["dis"].max())
+        # final_cell_df["weight"]=1-final_cell_df["dis"]
+
+        #spots
+        spot_df = new_adj_df[new_adj_df["index"].isin(list(st_data.obs_names)) & new_adj_df["index2"].isin(st_data.obs_names)]
+        #Take the first 20 of the nearest distance and take the intersection
+        spot_df1 = spot_df.sort_values(['index2','dis'], ascending=[True, True]).groupby('index2', group_keys=False).apply(lambda x: x.head(p))
+        spot_df2 = spot_df.sort_values(['index','dis'], ascending=[True, True]).groupby('index', group_keys=False).apply(lambda x: x.head(p))
+        final_spot_df=pd.merge(spot_df1, spot_df2, how='inner')
+
+
+        spot_to_cell_df = new_adj_df[(new_adj_df["index"].isin(list(st_data.obs_names))) & (new_adj_df["index2"].isin(list(sc_data.obs_names)))]
+        spot_to_cell_df = spot_to_cell_df.sort_values(['index', 'dis'], ascending=[True, True]).groupby('index', group_keys=False).apply(lambda x: x.head(q))
+        spot_to_cell_df = pd.merge(spot_to_cell_df, cell_df1,how='inner')
+
+        cell_to_spot_df1 = spot_to_cell_df.rename(columns={'index': 'spot1', 'index2': 'cell'})
+        cell_to_spot_df2 = spot_to_cell_df.rename(columns={'index': 'spot2', 'index2': 'cell'})
+        spot_cell_to_spot = cell_to_spot_df1.merge(cell_to_spot_df2,on='cell', suffixes=('_1', '_2'))
+        spot_cell_to_spot = spot_cell_to_spot[spot_cell_to_spot['spot1'] != spot_cell_to_spot['spot2']]
+        spot_cell_to_spot['dis'] = (spot_cell_to_spot['dis_1'] + spot_cell_to_spot['dis_2']) / 2 
+
+        spot_cell_to_spot = spot_cell_to_spot.groupby(['spot1', 'spot2'], as_index=False)['dis'].mean()
+        cell_spot_df = spot_cell_to_spot[['spot1', 'spot2', 'dis']]
+        cell_spot_df = cell_spot_df.rename(columns={'spot1': 'index', 'spot2': 'index2'})
+
+        diff_connections = cell_spot_df[~cell_spot_df.set_index(['index', 'index2']).index.isin(final_spot_df.set_index(['index', 'index2']).index)]
+        final_spot_df = pd.concat([final_spot_df, diff_connections], ignore_index=True)
+
+        final_spot_df["dis"] /= final_spot_df["dis"].max()
+        final_spot_df["weight"]=1-final_spot_df["dis"]
+        final_spot_df.loc[final_spot_df["weight"]==1,["weight"]]=0
+
+    return final_spot_df
